@@ -1,0 +1,62 @@
+# =============================================================================
+# Terraform
+# =============================================================================
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan*
+.terraform/
+.terraform.lock.hcl
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+# Local test files (not workspace configs)
+# workspaces/*.yaml files should be committed
+# =============================================================================
+# IDE and Editor
+# =============================================================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# =============================================================================
+# OS Generated
+# =============================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# =============================================================================
+# Secrets (should NEVER be committed)
+# =============================================================================
+*.pem
+*.key
+*.crt
+secrets.tfvars
+*.auto.tfvars
+.env
+.env.*
+credentials.json
+
+# =============================================================================
+# Logs and Outputs
+# =============================================================================
+*.log
+outputs*.json
+plan-output.txt
+workspaces/testonly.yaml
+workspaces/testonly2.yaml

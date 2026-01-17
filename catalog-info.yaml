@@ -1,0 +1,8 @@
+apiVersion: backstage.io/v1alpha1
+kind: Location
+metadata:
+  name: backstage-templates
+  description: Collection of Backstage scaffolder templates
+spec:
+  targets:
+    - ./mongodb-terraform/template.yaml

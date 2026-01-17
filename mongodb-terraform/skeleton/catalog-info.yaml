@@ -1,0 +1,21 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: ${{ values.applicationName }}-mongodb
+  description: MongoDB Atlas infrastructure for ${{ values.applicationName }}
+  annotations:
+    github.com/project-slug: ${{ values.repoSlug }}
+  tags:
+    - terraform
+    - mongodb
+    - atlas
+    - azure
+    - infrastructure
+  links:
+    - url: https://cloud.mongodb.com
+      title: MongoDB Atlas Console
+      icon: cloud
+spec:
+  type: infrastructure
+  lifecycle: production
+  owner: user:guest

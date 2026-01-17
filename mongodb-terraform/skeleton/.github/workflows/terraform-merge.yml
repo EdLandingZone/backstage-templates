@@ -1,0 +1,217 @@
+name: Terraform Apply (Merge)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'terraform/**'
+      - 'workspaces/**'
+      - '.github/workflows/terraform-merge.yml'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Terraform action to perform'
+        required: true
+        default: 'apply'
+        type: choice
+        options:
+          - apply
+          - destroy
+      workspace:
+        description: 'Specific workspace (leave empty for all)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TF_VERSION: '1.12.2'
+  TF_WORKING_DIR: 'terraform'
+  AWS_REGION: 'us-east-1'
+  TF_STATE_BUCKET: 'new-aws-bucket'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Discover Workspaces
+  # ---------------------------------------------------------------------------
+  discover:
+    name: Discover Workspaces
+    runs-on: ubuntu-latest
+    outputs:
+      workspaces: ${{ steps.workspaces.outputs.workspaces }}
+      matrix: ${{ steps.workspaces.outputs.matrix }}
+      has_workspaces: ${{ steps.workspaces.outputs.has_workspaces }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get Workspaces
+        id: workspaces
+        run: |
+          if [ -n "${{ github.event.inputs.workspace }}" ]; then
+            # Single workspace specified via workflow_dispatch
+            workspaces='["${{ github.event.inputs.workspace }}"]'
+          else
+            # Discover all workspaces from YAML files
+            workspace_files=$(ls workspaces/*.yaml 2>/dev/null || true)
+            if [ -z "$workspace_files" ]; then
+              echo "No workspace YAML files found - skipping terraform operations"
+              workspaces='[]'
+              echo "has_workspaces=false" >> $GITHUB_OUTPUT
+            else
+              workspaces=$(echo "$workspace_files" | xargs -I {} basename {} .yaml | jq -R -s -c 'split("\n")[:-1]')
+              echo "has_workspaces=true" >> $GITHUB_OUTPUT
+            fi
+          fi
+          echo "workspaces=$workspaces" >> $GITHUB_OUTPUT
+          echo "matrix={\"workspace\":$workspaces}" >> $GITHUB_OUTPUT
+          echo "Discovered workspaces: $workspaces"
+
+  # ---------------------------------------------------------------------------
+  # Validate (uses first workspace for validation)
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    needs: discover
+    if: needs.discover.outputs.has_workspaces == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::111111111111:role/your-oidc-role-name
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-TerraformApply
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        continue-on-error: true
+
+      - name: Get First Workspace
+        id: first-ws
+        run: echo "name=$(echo '${{ needs.discover.outputs.workspaces }}' | jq -r '.[0]')" >> $GITHUB_OUTPUT
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="key=${{ github.repository }}/workspaces/${{ steps.first-ws.outputs.name }}/terraform.tfstate"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Select Workspace
+        run: terraform workspace select ${{ steps.first-ws.outputs.name }} || terraform workspace new ${{ steps.first-ws.outputs.name }}
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+  # ---------------------------------------------------------------------------
+  # Apply (runs for each workspace sequentially)
+  # ---------------------------------------------------------------------------
+  apply:
+    name: Apply (${{ matrix.workspace }})
+    runs-on: ubuntu-latest
+    needs: [discover, validate]
+    if: needs.discover.outputs.has_workspaces == 'true' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply'))
+    environment: production
+    strategy:
+      fail-fast: false
+      max-parallel: 1  # Sequential execution to avoid race conditions
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::111111111111:role/your-oidc-role-name
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-TerraformApply
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="key=${{ github.repository }}/workspaces/${{ matrix.workspace }}/terraform.tfstate"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Select/Create Workspace
+        run: |
+          terraform workspace select ${{ matrix.workspace }} || terraform workspace new ${{ matrix.workspace }}
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve
+        working-directory: ${{ env.TF_WORKING_DIR }}
+      - name: Terraform Output
+        run: terraform output -json > outputs-${{ matrix.workspace }}.json
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Upload Outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-outputs-${{ matrix.workspace }}
+          path: ${{ env.TF_WORKING_DIR }}/outputs-${{ matrix.workspace }}.json
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Destroy (manual trigger only)
+  # ---------------------------------------------------------------------------
+  destroy:
+    name: Destroy (${{ matrix.workspace }})
+    runs-on: ubuntu-latest
+    needs: discover
+    if: needs.discover.outputs.has_workspaces == 'true' && github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+    environment: production-destroy
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::111111111111:role/your-oidc-role-name
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-TerraformApply
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="key=${{ github.repository }}/workspaces/${{ matrix.workspace }}/terraform.tfstate"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Select Workspace
+        run: terraform workspace select ${{ matrix.workspace }}
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Destroy
+        run: terraform destroy -auto-approve
+        working-directory: ${{ env.TF_WORKING_DIR }}

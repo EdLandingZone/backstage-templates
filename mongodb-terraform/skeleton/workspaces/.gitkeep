@@ -1,0 +1,3 @@
+# This directory contains workspace configuration files.
+# Each file (e.g., dev.yaml, staging.yaml, prod.yaml) defines
+# the MongoDB Atlas infrastructure for that environment.

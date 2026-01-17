@@ -1,0 +1,327 @@
+name: DBA Drift Detection
+
+on:
+  workflow_dispatch:
+    inputs:
+      workspace:
+        description: 'Specific workspace to check (leave empty for all)'
+        required: false
+        type: string
+      dry_run:
+        description: 'Dry run - detect drift but do not create PR'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+env:
+  TF_VERSION: '1.12.2'
+  TF_WORKING_DIR: 'terraform'
+  AWS_REGION: 'us-east-1'
+  TF_STATE_BUCKET: 'new-aws-bucket'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Discover Workspaces
+  # ---------------------------------------------------------------------------
+  discover:
+    name: Discover Workspaces
+    runs-on: ubuntu-latest
+    outputs:
+      workspaces: ${{ steps.workspaces.outputs.workspaces }}
+      matrix: ${{ steps.workspaces.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get Workspaces
+        id: workspaces
+        run: |
+          if [ -n "${{ github.event.inputs.workspace }}" ]; then
+            # Use specified workspace
+            workspaces='["${{ github.event.inputs.workspace }}"]'
+          else
+            # Discover all workspaces from YAML files (exclude -overrides files)
+            workspaces=$(ls workspaces/*.yaml 2>/dev/null | grep -v '\-overrides\.yaml' | xargs -I {} basename {} .yaml | jq -R -s -c 'split("\n")[:-1]')
+          fi
+          echo "workspaces=$workspaces" >> $GITHUB_OUTPUT
+          echo "matrix={\"workspace\":$workspaces}" >> $GITHUB_OUTPUT
+          echo "Discovered workspaces: $workspaces"
+
+  # ---------------------------------------------------------------------------
+  # Detect Drift (runs for each workspace)
+  # ---------------------------------------------------------------------------
+  detect-drift:
+    name: Detect Drift (${{ matrix.workspace }})
+    runs-on: ubuntu-latest
+    needs: discover
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::111111111111:role/your-oidc-role-name
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-DriftDetection
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Install yq
+        run: |
+          sudo snap install yq
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="key=${{ github.repository }}/workspaces/${{ matrix.workspace }}/terraform.tfstate"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Select Workspace
+        run: |
+          terraform workspace select ${{ matrix.workspace }} || terraform workspace new ${{ matrix.workspace }}
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Generate Plan JSON
+        id: plan
+        run: |
+          # Generate plan with JSON output for parsing
+          terraform plan -out=tfplan -no-color 2>&1 | tee plan-output.txt
+          terraform show -json tfplan > plan.json
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Detect Instance Size Drift
+        id: detect
+        run: |
+          WORKSPACE="${{ matrix.workspace }}"
+          DRIFT_FILE="drift-${WORKSPACE}.json"
+
+          # Read user's desired size from workspace config
+          USER_SIZE=$(yq -r '.cluster.instance_size' "../workspaces/${WORKSPACE}.yaml")
+          echo "User's desired instance_size (config): $USER_SIZE"
+
+          # Get current instance_size from Terraform state via plan prior_state
+          CURRENT_SIZE=$(jq -r '
+            .prior_state.values.root_module.child_modules[]? |
+            select(.address == "module.cluster") |
+            .resources[]? |
+            select(.type == "mongodbatlas_advanced_cluster") |
+            .values.replication_specs[0].region_configs[0].electable_specs.instance_size // empty
+          ' plan.json 2>/dev/null || echo "")
+
+          # Fallback: try parsing plan output text for instance_size
+          if [ -z "$CURRENT_SIZE" ]; then
+            # Look for instance_size in plan changes (format: "M10" -> "M30")
+            INSTANCE_CHANGE=$(grep -E 'instance_size.*->|instance_size.*:' plan-output.txt | head -1 || echo "")
+            if [ -n "$INSTANCE_CHANGE" ]; then
+              # Extract the current value (before the arrow if changing, or just the value)
+              CURRENT_SIZE=$(echo "$INSTANCE_CHANGE" | grep -oP '"M\d+"' | head -1 | tr -d '"' || echo "")
+            fi
+          fi
+
+          # Another fallback: check for "No changes" which means state matches config
+          if [ -z "$CURRENT_SIZE" ]; then
+            if grep -q "No changes" plan-output.txt; then
+              CURRENT_SIZE="$USER_SIZE"
+            fi
+          fi
+
+          echo "Current instance_size (state): $CURRENT_SIZE"
+
+          # Determine if drift exists: current state differs from user config
+          DRIFT_DETECTED="false"
+          DRIFT_VALUE=""
+
+          if [ -n "$CURRENT_SIZE" ] && [ "$CURRENT_SIZE" != "$USER_SIZE" ]; then
+            echo "DRIFT DETECTED: State has '$CURRENT_SIZE' but user config has '$USER_SIZE'"
+            DRIFT_DETECTED="true"
+            DRIFT_VALUE="$CURRENT_SIZE"
+          elif [ -z "$CURRENT_SIZE" ]; then
+            echo "WARNING: Could not determine current instance_size from state"
+          else
+            echo "No drift detected: State matches user config ($CURRENT_SIZE)"
+          fi
+
+          # Output results
+          echo "drift_detected=$DRIFT_DETECTED" >> $GITHUB_OUTPUT
+          echo "current_size=$CURRENT_SIZE" >> $GITHUB_OUTPUT
+          echo "user_size=$USER_SIZE" >> $GITHUB_OUTPUT
+          echo "drift_value=$DRIFT_VALUE" >> $GITHUB_OUTPUT
+
+          # Save drift info for later steps
+          jq -n \
+            --arg workspace "$WORKSPACE" \
+            --argjson drift_detected "$DRIFT_DETECTED" \
+            --arg current "$CURRENT_SIZE" \
+            --arg user "$USER_SIZE" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{workspace: $workspace, drift_detected: $drift_detected, current_instance_size: $current, user_instance_size: $user, drift_timestamp: $timestamp}' \
+            > "$DRIFT_FILE"
+
+          echo "Drift detection results:"
+          cat "$DRIFT_FILE"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Upload Drift Detection Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-${{ matrix.workspace }}
+          path: ${{ env.TF_WORKING_DIR }}/drift-${{ matrix.workspace }}.json
+          retention-days: 5
+
+  # ---------------------------------------------------------------------------
+  # Create Override PR
+  # ---------------------------------------------------------------------------
+  create-override-pr:
+    name: Create Override PR
+    runs-on: ubuntu-latest
+    needs: [discover, detect-drift]
+    if: ${{ github.event.inputs.dry_run != 'true' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download All Drift Results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: drift-*
+          path: drift-results
+          merge-multiple: true
+
+      - name: Install yq
+        run: |
+          sudo snap install yq
+
+      - name: Process Drift and Create Override Files
+        id: process
+        run: |
+          CHANGES_MADE="false"
+          DRIFT_SUMMARY=""
+
+          for drift_file in drift-results/drift-*.json; do
+            if [ -f "$drift_file" ]; then
+              WORKSPACE=$(jq -r '.workspace' "$drift_file")
+              DRIFT_DETECTED=$(jq -r '.drift_detected' "$drift_file")
+              CURRENT_SIZE=$(jq -r '.current_instance_size' "$drift_file")
+              USER_SIZE=$(jq -r '.user_instance_size' "$drift_file")
+              TIMESTAMP=$(jq -r '.drift_timestamp' "$drift_file")
+
+              if [ "$DRIFT_DETECTED" = "true" ]; then
+                OVERRIDE_FILE="workspaces/${WORKSPACE}-overrides.yaml"
+
+                echo "Processing drift for workspace: $WORKSPACE"
+                echo "  Current: $CURRENT_SIZE, User: $USER_SIZE"
+
+                # Create or update override file using yq
+                if [ -f "$OVERRIDE_FILE" ]; then
+                  # Update existing file
+                  yq -i ".cluster.instance_size = \"$CURRENT_SIZE\"" "$OVERRIDE_FILE"
+                  yq -i "._metadata.last_drift_detected = \"$TIMESTAMP\"" "$OVERRIDE_FILE"
+                  yq -i "._metadata.previous_values.instance_size = \"$USER_SIZE\"" "$OVERRIDE_FILE"
+                else
+                  # Create new override file using yq
+                  yq -n ".schema_version = 1" > "$OVERRIDE_FILE"
+                  yq -i ".cluster.instance_size = \"$CURRENT_SIZE\"" "$OVERRIDE_FILE"
+                  yq -i "._metadata.last_drift_detected = \"$TIMESTAMP\"" "$OVERRIDE_FILE"
+                  yq -i "._metadata.drift_source = \"drift-detection\"" "$OVERRIDE_FILE"
+                  yq -i "._metadata.previous_values.instance_size = \"$USER_SIZE\"" "$OVERRIDE_FILE"
+                  # Add header comment
+                  sed -i '1i# DBA Override Configuration: '"$WORKSPACE"'\n# Generated by: dba-drift-detection workflow' "$OVERRIDE_FILE"
+                fi
+
+                CHANGES_MADE="true"
+                DRIFT_SUMMARY="${DRIFT_SUMMARY}- **${WORKSPACE}**: instance_size ${USER_SIZE} -> ${CURRENT_SIZE}\n"
+              fi
+            fi
+          done
+
+          echo "changes_made=$CHANGES_MADE" >> $GITHUB_OUTPUT
+          # Save drift summary to file for PR body
+          echo -e "$DRIFT_SUMMARY" > /tmp/drift-summary.txt
+
+      - name: Create Pull Request
+        if: steps.process.outputs.changes_made == 'true'
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: Add DBA override for instance_size drift"
+          branch: dba-override/drift-detection-${{ github.run_id }}
+          delete-branch: true
+          title: "[DBA Override] Instance size drift detected"
+          body: |
+            ## DBA Override - Instance Size Drift Detected
+
+            This PR was automatically generated by the drift detection workflow.
+
+            ### Detected Drift
+
+            ${{ steps.process.outputs.drift_summary }}
+
+            ### What This Means
+
+            The MongoDB Atlas cluster's actual instance size differs from what is configured in the workspace YAML files. This typically happens when:
+            - Auto-scaling adjusted the instance size
+            - A DBA manually changed the instance size in Atlas console
+            - Atlas support made changes for performance reasons
+
+            ### Action Required
+
+            **Review and approve this PR** to preserve the DBA/Atlas changes. The override file ensures that:
+            1. Terraform will not revert the instance size on next apply
+            2. The actual cluster configuration is recorded in source control
+            3. Future changes can be tracked and audited
+
+            ### Files Changed
+
+            - `workspaces/*-overrides.yaml` - DBA override configuration files
+
+            ---
+            _Generated by DBA Drift Detection workflow_
+          labels: |
+            dba-override
+            auto-generated
+            needs-review
+
+      - name: Summary
+        run: |
+          echo "## DBA Drift Detection Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.process.outputs.changes_made }}" = "true" ]; then
+            echo "Drift was detected and a PR has been created." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Detected Changes" >> $GITHUB_STEP_SUMMARY
+            cat /tmp/drift-summary.txt >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "See PR for details" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No drift detected. All workspaces are in sync." >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Workspaces Checked" >> $GITHUB_STEP_SUMMARY
+
+          for drift_file in drift-results/drift-*.json; do
+            if [ -f "$drift_file" ]; then
+              WORKSPACE=$(jq -r '.workspace' "$drift_file")
+              DRIFT=$(jq -r '.drift_detected' "$drift_file")
+              CURRENT=$(jq -r '.current_instance_size' "$drift_file")
+              USER=$(jq -r '.user_instance_size' "$drift_file")
+
+              if [ "$DRIFT" = "true" ]; then
+                echo "- **$WORKSPACE**: Drift detected ($USER -> $CURRENT)" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "- **$WORKSPACE**: No drift ($CURRENT)" >> $GITHUB_STEP_SUMMARY
+              fi
+            fi
+          done

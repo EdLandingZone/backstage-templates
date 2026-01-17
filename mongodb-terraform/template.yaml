@@ -1,0 +1,339 @@
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: mongodb-atlas-terraform
+  title: MongoDB Atlas Infrastructure (Terraform)
+  description: |
+    Deploy MongoDB Atlas infrastructure with Azure Private Endpoint.
+    Automatically creates a workspace repo OR adds an environment to an existing one.
+    All environment additions go through PRs for approval.
+  tags:
+    - terraform
+    - mongodb
+    - atlas
+    - azure
+    - infrastructure
+spec:
+  owner: group:default/platform-team
+  type: infrastructure
+
+  parameters:
+    # Step 1: Basic Configuration
+    - title: Deployment Configuration
+      required:
+        - applicationName
+        - environment
+        - githubOrg
+      properties:
+        applicationName:
+          title: Application Name
+          type: string
+          description: Name of the application (lowercase, hyphens allowed)
+          pattern: "^[a-z][a-z0-9-]*[a-z0-9]$"
+          ui:autofocus: true
+          ui:help: "Used for resource naming. Example: my-app"
+
+        environment:
+          title: Environment
+          type: string
+          description: Environment name (e.g., dev, staging, prod)
+          pattern: "^[a-z][a-z0-9-]*$"
+
+        githubOrg:
+          title: GitHub Organization
+          type: string
+          description: GitHub org where repo will be created
+          default: your-github-org
+
+        owner:
+          title: Owner Team
+          type: string
+          description: Team responsible for this infrastructure
+          ui:field: OwnerPicker
+          ui:options:
+            catalogFilter:
+              kind: [Group, User]
+
+    # Step 2: MongoDB Atlas Configuration
+    # Note: Cluster type is always REPLICASET, cloud provider is always AZURE,
+    # and auto-scaling is always enabled. These are hardcoded in Terraform.
+    - title: MongoDB Atlas Configuration
+      required:
+        - clusterRegion
+        - instanceSize
+      properties:
+        clusterRegion:
+          title: Primary Cluster Region
+          type: string
+          description: Atlas region for the cluster (must match your Azure region)
+          default: US_EAST_2
+          enum:
+            - US_EAST
+            - US_EAST_2
+            - US_WEST
+            - US_WEST_2
+            - US_CENTRAL
+            - EUROPE_NORTH
+            - EUROPE_WEST
+          enumNames:
+            - US East (Virginia)
+            - US East 2 (Virginia)
+            - US West (California)
+            - US West 2 (Washington)
+            - US Central (Iowa)
+            - Europe North (Ireland)
+            - Europe West (Netherlands)
+
+        instanceSize:
+          title: Instance Size
+          type: string
+          default: M10
+          enum:
+            - M10
+            - M20
+            - M30
+            - M40
+            - M50
+            - M60
+          enumNames:
+            - M10 (Dev/Test - 2GB RAM)
+            - M20 (Small - 4GB RAM)
+            - M30 (Medium - 8GB RAM)
+            - M40 (Large - 16GB RAM)
+            - M50 (XLarge - 32GB RAM)
+            - M60 (XXLarge - 64GB RAM)
+
+    # Step 3: Azure AD & RBAC Configuration
+    - title: Azure AD Configuration
+      required:
+        - devGroupId
+        - leadGroupId
+      properties:
+        devGroupId:
+          title: Developer Azure AD Group ID
+          type: string
+          default: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+          description: Azure AD Group ID for developers (project read access)
+          ui:help: "Find in Azure Portal > Azure Active Directory > Groups"
+
+        leadGroupId:
+          title: Lead Azure AD Group ID
+          type: string
+          default: ffffffff-1111-2222-3333-444444444444
+          description: Azure AD Group ID for leads (project owner access)
+
+    # Step 4: Azure Container App
+    - title: Azure Container App
+      required:
+        - containerApp
+      properties:
+        containerApp:
+          title: Azure Container Instance App
+          type: string
+          default: Service A
+          description: Select the Azure Container App to connect
+          enum:
+            - Service A
+            - Service B
+
+    # Step 5: PrivateLink Endpoints
+    - title: PrivateLink Endpoints
+      required:
+        - privatelinkEndpoints
+      properties:
+        privatelinkEndpoints:
+          title: PrivateLink Endpoints
+          type: array
+          minItems: 1
+          description: Configure Azure Private Endpoints for secure MongoDB connectivity
+          ui:options:
+            addable: true
+            orderable: false
+            removable: true
+          items:
+            type: object
+            required:
+              - azureLocation
+              - subnetId
+            properties:
+              azureLocation:
+                title: Azure Location
+                type: string
+                default: eastus2
+                description: Azure region for the private endpoint
+                enum:
+                  - eastus
+                  - eastus2
+                  - westus
+                  - westus2
+                  - centralus
+                  - northeurope
+                  - westeurope
+                enumNames:
+                  - East US
+                  - East US 2
+                  - West US
+                  - West US 2
+                  - Central US
+                  - North Europe
+                  - West Europe
+              subnetId:
+                title: Subnet Resource ID
+                type: string
+                default: /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/your-resource-group/providers/Microsoft.Network/virtualNetworks/your-vnet-name/subnets/your-subnet-name
+                description: Azure subnet for the private endpoint
+
+    # Step 6: Network Access (Optional)
+    - title: Network Access
+      properties:
+        accessCidrs:
+          title: IP/CIDR Access List
+          type: array
+          default: []
+          description: IP addresses or CIDR blocks allowed to connect to MongoDB (optional - leave empty for PrivateLink-only access)
+          ui:options:
+            orderable: false
+          items:
+            type: string
+            title: IP or CIDR
+            ui:help: "Examples: 10.0.0.0/16, 192.168.1.0/24, 1.2.3.4/32"
+
+  steps:
+    # Step 1: Check if workspace repo already exists in catalog
+    - id: check-catalog
+      name: Checking for Existing Workspace
+      action: catalog:fetch
+      input:
+        entityRef: component:default/${{ parameters.applicationName }}-mongodb
+        optional: true
+
+    # Step 2: Log the detection result
+    - id: log-detection
+      name: Determining Workflow Path
+      action: debug:log
+      input:
+        message: "Repo exists: ${{ steps['check-catalog'].output.entity | dump }}"
+
+    # === INITIALIZE REPO (only if it doesn't exist) ===
+    - id: fetch-base-skeleton
+      name: Preparing Base Repository
+      if: ${{ not steps['check-catalog'].output.entity }}
+      action: fetch:template
+      input:
+        url: ./skeleton
+        copyWithoutTemplating:
+          - .github/workflows/terraform-pr.yml
+          - .github/workflows/terraform-merge.yml
+          - .github/workflows/terraform-destroy.yml
+          - .github/workflows/dba-drift-detection.yml
+        values:
+          applicationName: ${{ parameters.applicationName }}
+          owner: ${{ parameters.owner }}
+          repoSlug: ${{ parameters.githubOrg }}/${{ parameters.applicationName }}-mongodb
+
+    - id: publish-new-repo
+      name: Creating Repository
+      if: ${{ not steps['check-catalog'].output.entity }}
+      action: publish:github
+      input:
+        repoUrl: github.com?owner=${{ parameters.githubOrg }}&repo=${{ parameters.applicationName }}-mongodb
+        description: "MongoDB Atlas infrastructure for ${{ parameters.applicationName }}"
+        repoVisibility: private
+        defaultBranch: main
+        deleteBranchOnMerge: true
+        gitCommitMessage: "Initial MongoDB Atlas infrastructure via Backstage"
+        topics:
+          - terraform
+          - mongodb
+          - atlas
+          - infrastructure
+          - managed-by-backstage
+
+    - id: register
+      name: Registering in Catalog
+      if: ${{ not steps['check-catalog'].output.entity }}
+      action: catalog:register
+      input:
+        repoContentsUrl: ${{ steps['publish-new-repo'].output.repoContentsUrl }}
+        catalogInfoPath: /catalog-info.yaml
+
+    # === CREATE ENVIRONMENT PR (always runs) ===
+    - id: fetch-env-file
+      name: Preparing Environment File
+      action: fetch:template
+      input:
+        url: ./skeleton-env
+        targetPath: workspaces
+        values:
+          applicationName: ${{ parameters.applicationName }}
+          environment: ${{ parameters.environment }}
+          clusterRegion: ${{ parameters.clusterRegion }}
+          instanceSize: ${{ parameters.instanceSize }}
+          devGroupId: ${{ parameters.devGroupId }}
+          leadGroupId: ${{ parameters.leadGroupId }}
+          privatelinkEndpoints: ${{ parameters.privatelinkEndpoints }}
+          accessCidrs: ${{ parameters.accessCidrs }}
+
+    - id: rename-env-file
+      name: Rename Environment File
+      action: fs:rename
+      input:
+        files:
+          - from: workspaces/environment.yaml
+            to: workspaces/${{ parameters.environment }}.yaml
+
+    - id: create-pr
+      name: Creating Pull Request for Approval
+      action: publish:github:pull-request
+      input:
+        repoUrl: github.com?owner=${{ parameters.githubOrg }}&repo=${{ parameters.applicationName }}-mongodb
+        branchName: add-env-${{ parameters.environment }}
+        title: "Add MongoDB environment: ${{ parameters.environment }}"
+        description: |
+          ## New MongoDB Atlas Environment
+
+          Adding `${{ parameters.environment }}` environment for `${{ parameters.applicationName }}`.
+
+          **File**: `workspaces/${{ parameters.environment }}.yaml`
+
+          ### Configuration Summary
+          | Setting | Value |
+          |---------|-------|
+          | Cluster Region | `${{ parameters.clusterRegion }}` |
+          | Instance Size | `${{ parameters.instanceSize }}` |
+
+          ### Resources Created
+          - MongoDB Atlas Project
+          - MongoDB Atlas Cluster (REPLICASET)
+          - Azure PrivateLink Endpoints
+          - Azure AD Group Role Mappings
+
+          ---
+          Generated by Backstage Scaffolder
+
+  output:
+    links:
+      - title: Repository
+        url: ${{ steps['publish-new-repo'].output.remoteUrl }}
+        if: ${{ not steps['check-catalog'].output.entity }}
+      - title: View in Catalog
+        icon: catalog
+        entityRef: ${{ steps['register'].output.entityRef }}
+        if: ${{ not steps['check-catalog'].output.entity }}
+      - title: Pull Request
+        url: ${{ steps['create-pr'].output.remoteUrl }}
+    text:
+      - title: Next Steps
+        content: |
+          ## MongoDB Atlas Infrastructure
+
+          ${{ "Repository created and PR opened" if not steps['check-catalog'].output.entity else "Pull request opened" }}!
+
+          ### Getting Started
+
+          After merge, the Terraform workflow will:
+          1. Create MongoDB Atlas Project
+          2. Deploy Cluster in the selected region
+          3. Configure Azure PrivateLink endpoints
+          4. Create database users (admin, readwrite, read)
+          5. Map Azure AD groups to Atlas roles

@@ -1,0 +1,108 @@
+name: Test Templates
+
+on:
+  push:
+    paths:
+      - 'templates/**'
+  pull_request:
+    paths:
+      - 'templates/**'
+
+jobs:
+  validate-templates:
+    name: Validate Template Structure
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install -g ajv-cli js-yaml
+
+      - name: Validate template.yaml schema
+        run: |
+          for template in templates/*/template.yaml; do
+            echo "Validating $template..."
+            # Convert YAML to JSON and validate structure
+            node -e "
+              const yaml = require('js-yaml');
+              const fs = require('fs');
+              const doc = yaml.load(fs.readFileSync('$template', 'utf8'));
+              if (!doc.apiVersion || !doc.kind || !doc.metadata || !doc.spec) {
+                console.error('Missing required fields');
+                process.exit(1);
+              }
+              console.log('✓ Valid structure');
+            "
+          done
+
+  test-terraform-skeletons:
+    name: Test Terraform Skeletons
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.6.0'
+
+      - name: Render and validate skeletons
+        run: |
+          for skeleton_dir in templates/*/skeleton/terraform; do
+            if [ -d "$skeleton_dir" ]; then
+              echo "Testing $skeleton_dir..."
+
+              # Create temp directory with rendered files
+              temp_dir=$(mktemp -d)
+              cp -r "$skeleton_dir"/* "$temp_dir/"
+
+              # Replace template variables with test values
+              find "$temp_dir" -type f -name "*.tf" -exec sed -i \
+                -e 's/\${{ values\.projectName }}/testproject/g' \
+                -e 's/\${{ values\.environment }}/dev/g' \
+                -e 's/\${{ values\.owner }}/team-platform/g' \
+                -e 's/\${{ values\.subscriptionId }}/00000000-0000-0000-0000-000000000000/g' \
+                -e 's/\${{ values\.azureRegion }}/eastus/g' \
+                -e 's/\${{ values\.resourceGroupName }}/test-rg/g' \
+                -e 's/\${{ values\.storageAccountTier }}/Standard/g' \
+                -e 's/\${{ values\.storageReplicationType }}/LRS/g' \
+                -e 's/\${{ values\.enableHttpsOnly }}/true/g' \
+                -e 's/\${{ values\.minTlsVersion }}/TLS1_2/g' \
+                {} \;
+
+              # Validate Terraform
+              cd "$temp_dir"
+              terraform init -backend=false
+              terraform validate
+              terraform fmt -check
+
+              echo "✓ $skeleton_dir passed"
+              cd -
+              rm -rf "$temp_dir"
+            fi
+          done
+
+  lint-github-actions:
+    name: Lint GitHub Actions in Skeletons
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check workflow syntax
+        run: |
+          for workflow in templates/*/skeleton/.github/workflows/*.yml; do
+            if [ -f "$workflow" ]; then
+              echo "Checking $workflow..."
+              # Basic YAML syntax check
+              python3 -c "import yaml; yaml.safe_load(open('$workflow'))" || exit 1
+              echo "✓ Valid YAML"
+            fi
+          done

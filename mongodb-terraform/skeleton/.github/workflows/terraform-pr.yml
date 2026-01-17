@@ -1,0 +1,347 @@
+name: Terraform Plan (PR)
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'terraform/**'
+      - 'workspaces/**'
+      - '.github/workflows/terraform-pr.yml'
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+env:
+  TF_VERSION: '1.12.2'
+  TF_WORKING_DIR: 'terraform'
+  AWS_REGION: 'us-east-1'
+  TF_STATE_BUCKET: 'new-aws-bucket'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Discover Workspaces
+  # ---------------------------------------------------------------------------
+  discover:
+    name: Discover Workspaces
+    runs-on: ubuntu-latest
+    outputs:
+      workspaces: ${{ steps.workspaces.outputs.workspaces }}
+      matrix: ${{ steps.workspaces.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get Workspaces
+        id: workspaces
+        run: |
+          # Discover all workspaces from YAML files
+          workspaces=$(ls workspaces/*.yaml 2>/dev/null | xargs -I {} basename {} .yaml | jq -R -s -c 'split("\n")[:-1]')
+          echo "workspaces=$workspaces" >> $GITHUB_OUTPUT
+          echo "matrix={\"workspace\":$workspaces}" >> $GITHUB_OUTPUT
+          echo "Discovered workspaces: $workspaces"
+
+  # ---------------------------------------------------------------------------
+  # Validate (uses first workspace for validation)
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    needs: discover
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::111111111111:role/your-oidc-role-name
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-TerraformPlan
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        continue-on-error: true
+
+      - name: Get First Workspace
+        id: first-ws
+        run: echo "name=$(echo '${{ needs.discover.outputs.workspaces }}' | jq -r '.[0]')" >> $GITHUB_OUTPUT
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="key=${{ github.repository }}/workspaces/${{ steps.first-ws.outputs.name }}/terraform.tfstate"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Select Workspace
+        run: terraform workspace select ${{ steps.first-ws.outputs.name }} || terraform workspace new ${{ steps.first-ws.outputs.name }}
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+  # ---------------------------------------------------------------------------
+  # Plan (runs for each workspace)
+  # ---------------------------------------------------------------------------
+  plan:
+    name: Plan (${{ matrix.workspace }})
+    runs-on: ubuntu-latest
+    needs: [discover, validate]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::111111111111:role/your-oidc-role-name
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-TerraformPlan
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        id: init
+        run: |
+          terraform init \
+            -backend-config="key=${{ github.repository }}/workspaces/${{ matrix.workspace }}/terraform.tfstate"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Select/Create Workspace
+        run: |
+          terraform workspace select ${{ matrix.workspace }} || terraform workspace new ${{ matrix.workspace }}
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan -no-color -out=tfplan-${{ matrix.workspace }} 2>&1 | tee plan-output.txt
+          echo "exitcode=$?" >> $GITHUB_OUTPUT
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        continue-on-error: true
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.workspace }}
+          path: ${{ env.TF_WORKING_DIR }}/tfplan-${{ matrix.workspace }}
+          retention-days: 5
+
+      - name: Generate Plan Summary
+        id: summary
+        run: |
+          # Extract resource counts from plan
+          adds=$(grep -oP '(\d+) to add' plan-output.txt | grep -oP '\d+' || echo "0")
+          changes=$(grep -oP '(\d+) to change' plan-output.txt | grep -oP '\d+' || echo "0")
+          destroys=$(grep -oP '(\d+) to destroy' plan-output.txt | grep -oP '\d+' || echo "0")
+
+          # Check for no changes
+          if grep -q "No changes" plan-output.txt; then
+            adds="0"
+            changes="0"
+            destroys="0"
+          fi
+
+          # Extract resource names by action type
+          # Format: "# resource_address will be created/updated/destroyed"
+          resources_add=$(grep -E "# .* will be created" plan-output.txt | sed 's/.*# //' | sed 's/ will be created//' | sort | tr '\n' ',' | sed 's/,$//' || echo "")
+          resources_change=$(grep -E "# .* will be updated" plan-output.txt | sed 's/.*# //' | sed 's/ will be updated.*//' | sort | tr '\n' ',' | sed 's/,$//' || echo "")
+          resources_destroy=$(grep -E "# .* will be destroyed" plan-output.txt | sed 's/.*# //' | sed 's/ will be destroyed//' | sort | tr '\n' ',' | sed 's/,$//' || echo "")
+
+          echo "adds=$adds" >> $GITHUB_OUTPUT
+          echo "changes=$changes" >> $GITHUB_OUTPUT
+          echo "destroys=$destroys" >> $GITHUB_OUTPUT
+          echo "resources_add=$resources_add" >> $GITHUB_OUTPUT
+          echo "resources_change=$resources_change" >> $GITHUB_OUTPUT
+          echo "resources_destroy=$resources_destroy" >> $GITHUB_OUTPUT
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Save Plan Summary
+        run: |
+          mkdir -p /tmp/plan-summaries
+          jq -n \
+            --arg workspace "${{ matrix.workspace }}" \
+            --arg adds "${{ steps.summary.outputs.adds }}" \
+            --arg changes "${{ steps.summary.outputs.changes }}" \
+            --arg destroys "${{ steps.summary.outputs.destroys }}" \
+            --arg resources_add "${{ steps.summary.outputs.resources_add }}" \
+            --arg resources_change "${{ steps.summary.outputs.resources_change }}" \
+            --arg resources_destroy "${{ steps.summary.outputs.resources_destroy }}" \
+            --arg status "${{ steps.plan.outcome }}" \
+            '{workspace: $workspace, adds: $adds, changes: $changes, destroys: $destroys, resources_add: $resources_add, resources_change: $resources_change, resources_destroy: $resources_destroy, status: $status}' \
+            > /tmp/plan-summaries/${{ matrix.workspace }}.json
+
+      - name: Upload Plan Summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan-summary-${{ matrix.workspace }}
+          path: /tmp/plan-summaries/${{ matrix.workspace }}.json
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Comment on PR with Plan Summary
+  # ---------------------------------------------------------------------------
+  comment:
+    name: Post Plan Comment
+    runs-on: ubuntu-latest
+    needs: [discover, plan]
+    steps:
+      - name: Download All Plan Summaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: plan-summary-*
+          path: plan-summaries
+          merge-multiple: true
+
+      - name: Generate PR Comment
+        id: comment
+        run: |
+          echo "## Terraform Plan Summary" > comment.md
+          echo "" >> comment.md
+          echo "| Workspace | Adds | Changes | Destroys | Status |" >> comment.md
+          echo "|-----------|------|---------|----------|--------|" >> comment.md
+
+          total_adds=0
+          total_changes=0
+          total_destroys=0
+          any_failed=false
+
+          # Collect resource details for each workspace
+          declare -a workspace_details
+
+          for file in plan-summaries/*.json; do
+            if [ -f "$file" ]; then
+              workspace=$(jq -r '.workspace' "$file")
+              adds=$(jq -r '.adds' "$file")
+              changes=$(jq -r '.changes' "$file")
+              destroys=$(jq -r '.destroys' "$file")
+              status=$(jq -r '.status' "$file")
+              resources_add=$(jq -r '.resources_add' "$file")
+              resources_change=$(jq -r '.resources_change' "$file")
+              resources_destroy=$(jq -r '.resources_destroy' "$file")
+
+              total_adds=$((total_adds + adds))
+              total_changes=$((total_changes + changes))
+              total_destroys=$((total_destroys + destroys))
+
+              if [ "$status" = "success" ]; then
+                status_icon="✅"
+              else
+                status_icon="❌"
+                any_failed=true
+              fi
+
+              echo "| \`$workspace\` | +$adds | ~$changes | -$destroys | $status_icon |" >> comment.md
+
+              # Store details for later
+              workspace_details+=("$workspace|$resources_add|$resources_change|$resources_destroy")
+            fi
+          done
+
+          echo "| **Total** | **+$total_adds** | **~$total_changes** | **-$total_destroys** | |" >> comment.md
+          echo "" >> comment.md
+
+          if [ "$any_failed" = true ]; then
+            echo "⚠️ **One or more plans failed. Review the workflow logs for details.**" >> comment.md
+            echo "" >> comment.md
+          fi
+
+          # Add resource details per workspace
+          echo "### Resource Details" >> comment.md
+          echo "" >> comment.md
+
+          for detail in "${workspace_details[@]}"; do
+            IFS='|' read -r ws res_add res_change res_destroy <<< "$detail"
+
+            echo "<details><summary><b>$ws</b></summary>" >> comment.md
+            echo "" >> comment.md
+
+            if [ -n "$res_add" ] && [ "$res_add" != "" ]; then
+              echo "**To be created:**" >> comment.md
+              IFS=',' read -ra ITEMS <<< "$res_add"
+              for item in "${ITEMS[@]}"; do
+                echo "- \`$item\`" >> comment.md
+              done
+              echo "" >> comment.md
+            fi
+
+            if [ -n "$res_change" ] && [ "$res_change" != "" ]; then
+              echo "**To be updated:**" >> comment.md
+              IFS=',' read -ra ITEMS <<< "$res_change"
+              for item in "${ITEMS[@]}"; do
+                echo "- \`$item\`" >> comment.md
+              done
+              echo "" >> comment.md
+            fi
+
+            if [ -n "$res_destroy" ] && [ "$res_destroy" != "" ]; then
+              echo "**To be destroyed:**" >> comment.md
+              IFS=',' read -ra ITEMS <<< "$res_destroy"
+              for item in "${ITEMS[@]}"; do
+                echo "- \`$item\`" >> comment.md
+              done
+              echo "" >> comment.md
+            fi
+
+            if [ -z "$res_add" ] && [ -z "$res_change" ] && [ -z "$res_destroy" ]; then
+              echo "_No changes_" >> comment.md
+              echo "" >> comment.md
+            fi
+
+            echo "</details>" >> comment.md
+            echo "" >> comment.md
+          done
+
+          echo "---" >> comment.md
+          echo "_Merge this PR to apply changes to all workspaces._" >> comment.md
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const comment = fs.readFileSync('comment.md', 'utf8');
+
+            // Find existing comment to update
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('Terraform Plan Summary')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: comment
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment
+              });
+            }
