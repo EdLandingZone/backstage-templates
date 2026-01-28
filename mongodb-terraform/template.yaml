@@ -14,7 +14,7 @@ metadata:
     - azure
     - infrastructure
 spec:
-  owner: group:default/platform-team
+  owner: group:default/lz-team-admins
   type: infrastructure
 
   parameters:
